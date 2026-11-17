@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TradeHub</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2230; --muted:#6b7385; --line:#e6e8ee; --up:#0f9d58; --down:#d93025; --brand:#5367ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1218; --card:#171b23; --text:#e8ebf2; --muted:#8b93a7; --line:#262c38; --up:#34c77b; --down:#ff6b5e; --brand:#7b8cff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 20px; background:var(--card); border-bottom:1px solid var(--line); }
+  header b { font-size:18px; color:var(--brand); }
+  .badge { font-size:12px; padding:3px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .badge.live { color:#fff; background:var(--down); border-color:var(--down); }
+  main { display:grid; grid-template-columns: 300px 1fr 300px; gap:16px; padding:16px 20px; max-width:1500px; margin:auto; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  h3 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .row { display:flex; justify-content:space-between; align-items:center; padding:9px 8px; border-radius:8px; cursor:pointer; }
+  .row:hover, .row.sel { background:var(--bg); }
+  .sym { font-weight:600; }
+  .r { text-align:right; font-variant-numeric: tabular-nums; }
+  .up { color:var(--up); } .down { color:var(--down); }
+  .muted { color:var(--muted); }
+  .tabs button { border:1px solid var(--line); background:none; color:var(--text); padding:4px 10px; border-radius:6px; cursor:pointer; margin-right:4px; }
+  .tabs button.on { background:var(--brand); color:#fff; border-color:var(--brand); }
+  #chart { height:340px; margin-top:10px; }
+  .big { font-size:28px; font-weight:700; }
+  input { width:100%; padding:9px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px; }
+  .buy, .sell { width:100%; padding:11px; border:0; border-radius:8px; color:#fff; font-weight:600; font-size:14px; cursor:pointer; margin-top:8px; }
+  .buy { background:var(--up); } .sell { background:var(--down); }
+  .buy:disabled, .sell:disabled { opacity:.5; cursor:wait; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  th { text-align:left; font-size:12px; color:var(--muted); font-weight:500; padding:6px 8px; }
+  td { padding:8px; border-top:1px solid var(--line); }
+  td.r, th.r { text-align:right; }
+  .msg { margin-top:10px; padding:9px; border-radius:8px; font-size:13px; background:var(--bg); }
+  .stack > * + * { margin-top:16px; }
+  .x { color:var(--muted); cursor:pointer; margin-left:8px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import React, { useState, useEffect, useRef, useCallback } from "https://esm.sh/react@18.3.1";
+import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+import htm from "https://esm.sh/htm@3.1.1";
+const html = htm.bind(React.createElement);
+
+// ---- tiny GraphQL client (no library needed) ----
+async function gql(query, variables) {
+  const res = await fetch("/graphql", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }) });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+  return json.data;
+}
+
+const Q_WATCH = `{ watchlist { symbol price change changePct direction } }`;
+const Q_PORT = `{ portfolio { cash invested current pnl pnlPct totalValue broker
+  holdings { symbol qty avgPrice ltp invested current pnl pnlPct dayChange } } }`;
+const Q_ORDERS = `{ orders(limit: 15) { id createdAt symbol side qty price status message } }`;
+const Q_HIST = `query($s:String!,$r:String!){ history(symbol:$s, range:$r){ time open high low close } }`;
+const M_ORDER = `mutation($s:String!,$d:String!,$q:Int!){ placeOrder(symbol:$s, side:$d, qty:$q){ id status price message } }`;
+const M_ADD = `mutation($s:String!){ addToWatchlist(symbol:$s) }`;
+const M_DEL = `mutation($s:String!){ removeFromWatchlist(symbol:$s) }`;
+
+const inr = (n) => "₹" + Number(n).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const sign = (n) => (n > 0 ? "+" : "") + Number(n).toFixed(2);
+const cls = (n) => (n > 0 ? "up" : n < 0 ? "down" : "muted");
+
+function Chart({ symbol, range, up }) {
+  const box = useRef(null);
+  useEffect(() => {
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const chart = LightweightCharts.createChart(box.current, {
+      height: 340, autoSize: true,
+      layout: { background: { color: "transparent" }, textColor: dark ? "#8b93a7" : "#6b7385" },
+      grid: { vertLines: { visible: false }, horzLines: { color: dark ? "#262c38" : "#e6e8ee" } },
+      timeScale: { timeVisible: range === "1D" || range === "1W", borderVisible: false },
+      rightPriceScale: { borderVisible: false },
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: dark ? "#34c77b" : "#0f9d58", downColor: dark ? "#ff6b5e" : "#d93025",
+      wickUpColor: dark ? "#34c77b" : "#0f9d58", wickDownColor: dark ? "#ff6b5e" : "#d93025", borderVisible: false,
+    });
+    let dead = false;
+    gql(Q_HIST, { s: symbol, r: range }).then((d) => {
+      if (dead) return;
+      const seen = new Set();
+      const data = d.history.filter((c) => !seen.has(c.time) && seen.add(c.time)).sort((a, b) => a.time - b.time);
+      series.setData(data);
+      chart.timeScale().fitContent();
+    });
+    return () => { dead = true; chart.remove(); };
+  }, [symbol, range]);
+  return html`<div id="chart" ref=${box}></div>`;
+}
+
+function App() {
+  const [watch, setWatch] = useState([]);
+  const [port, setPort] = useState(null);
+  const [orders, setOrders] = useState([]);
+  const [sel, setSel] = useState("RELIANCE");
+  const [range, setRange] = useState("1M");
+  const [qty, setQty] = useState("1");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [newSym, setNewSym] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      const [w, p, o] = await Promise.all([gql(Q_WATCH), gql(Q_PORT), gql(Q_ORDERS)]);
+      setWatch(w.watchlist); setPort(p.portfolio); setOrders(o.orders);
+    } catch (e) { setMsg(e.message); }
+  }, []);
+
+  useEffect(() => { refresh(); const t = setInterval(refresh, 10000); return () => clearInterval(t); }, [refresh]);
+
+  const cur = watch.find((w) => w.symbol === sel);
+
+  async function trade(side) {
+    const q = parseInt(qty, 10);
+    if (!(q > 0)) return setMsg("Enter a quantity of 1 or more");
+    if (port && port.broker !== "paper" && !confirm(`REAL MONEY: ${side} ${q} x ${sel} at about ${cur ? inr(cur.price) : "market"}?`)) return;
+    setBusy(true);
+    try {
+      const r = (await gql(M_ORDER, { s: sel, d: side, q })).placeOrder;
+      setMsg(`${r.status}: ${side} ${q} ${sel} @ ${inr(r.price)}${r.message ? " — " + r.message : ""}`);
+      await refresh();
+    } catch (e) { setMsg(e.message); }
+    setBusy(false);
+  }
+
+  async function add(e) {
+    e.preventDefault();
+    if (!newSym.trim()) return;
+    try { await gql(M_ADD, { s: newSym.trim().toUpperCase() }); setNewSym(""); await refresh(); } catch (err) { setMsg(err.message); }
+  }
+  async function del(e, s) { e.stopPropagation(); await gql(M_DEL, { s }); refresh(); }
+
+  return html`
+    <header>
+      <b>TradeHub</b>
+      <span>${port && html`<span class=${"badge " + (port.broker === "paper" ? "" : "live")}>${port.broker === "paper" ? "PAPER TRADING (virtual money)" : "LIVE — REAL MONEY"}</span>`}</span>
+    </header>
+    <main>
+      <div class="card">
+        <h3>Watchlist</h3>
+        ${watch.map((w) => html`
+          <div class=${"row " + (w.symbol === sel ? "sel" : "")} onClick=${() => setSel(w.symbol)}>
+            <div><span class="sym">${w.symbol}</span><span class="x" onClick=${(e) => del(e, w.symbol)}>×</span></div>
+            <div class="r"><div>${inr(w.price)}</div><div class=${cls(w.change)}>${w.direction === "UP" ? "▲" : w.direction === "DOWN" ? "▼" : "•"} ${sign(w.change)} (${sign(w.changePct)}%)</div></div>
+          </div>`)}
+        <form onSubmit=${add} style=${{ marginTop: "10px" }}><input placeholder="Add symbol e.g. LT, press Enter" value=${newSym} onInput=${(e) => setNewSym(e.target.value)} /></form>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <div style=${{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div class="muted">${sel} · NSE</div>
+              <div class="big">${cur ? inr(cur.price) : "…"}</div>
+              ${cur && html`<div class=${cls(cur.change)}>${cur.direction === "UP" ? "▲" : "▼"} ${sign(cur.change)} (${sign(cur.changePct)}%) today</div>`}
+            </div>
+            <div class="tabs">${["1D", "1W", "1M", "6M", "1Y"].map((r) => html`<button class=${r === range ? "on" : ""} onClick=${() => setRange(r)}>${r}</button>`)}</div>
+          </div>
+          <${Chart} symbol=${sel} range=${range} />
+        </div>
+
+        <div class="card">
+          <h3>Holdings</h3>
+          ${port && port.holdings.length === 0 ? html`<div class="muted">No holdings yet. Buy something from the panel on the right.</div>` : html`
+          <table>
+            <thead><tr><th>Stock</th><th class="r">Qty</th><th class="r">Avg</th><th class="r">LTP</th><th class="r">Today</th><th class="r">P&L</th></tr></thead>
+            <tbody>${port && port.holdings.map((h) => html`<tr onClick=${() => setSel(h.symbol)} style=${{ cursor: "pointer" }}>
+              <td class="sym">${h.symbol}</td><td class="r">${h.qty}</td><td class="r">${inr(h.avgPrice)}</td><td class="r">${inr(h.ltp)}</td>
+              <td class=${"r " + cls(h.dayChange)}>${sign(h.dayChange)}</td>
+              <td class=${"r " + cls(h.pnl)}>${sign(h.pnl)} (${sign(h.pnlPct)}%)</td></tr>`)}</tbody>
+          </table>`}
+        </div>
+
+        <div class="card">
+          <h3>Recent orders</h3>
+          <table>
+            <thead><tr><th>Time</th><th>Stock</th><th>Side</th><th class="r">Qty</th><th class="r">Price</th><th>Status</th></tr></thead>
+            <tbody>${orders.map((o) => html`<tr title=${o.message || ""}>
+              <td class="muted">${o.createdAt}</td><td class="sym">${o.symbol}</td><td class=${o.side === "BUY" ? "up" : "down"}>${o.side}</td>
+              <td class="r">${o.qty}</td><td class="r">${inr(o.price)}</td><td class=${o.status === "REJECTED" ? "down" : ""}>${o.status}</td></tr>`)}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <h3>Trade ${sel}</h3>
+          <div class="muted" style=${{ marginBottom: "6px" }}>Quantity</div>
+          <input type="number" min="1" step="1" value=${qty} onInput=${(e) => setQty(e.target.value)} />
+          <div class="muted" style=${{ margin: "8px 0 0" }}>Approx. value: ${cur ? inr((parseInt(qty, 10) || 0) * cur.price) : "—"}</div>
+          <button class="buy" disabled=${busy} onClick=${() => trade("BUY")}>Buy</button>
+          <button class="sell" disabled=${busy} onClick=${() => trade("SELL")}>Sell</button>
+          ${msg && html`<div class="msg">${msg}</div>`}
+        </div>
+        <div class="card">
+          <h3>Portfolio</h3>
+          ${port && html`
+            <div class="big">${inr(port.totalValue)}</div>
+            <div class=${cls(port.pnl)}>${sign(port.pnl)} (${sign(port.pnlPct)}%) overall</div>
+            <div style=${{ marginTop: "12px" }}>
+              <div class="row" style=${{ cursor: "default" }}><span class="muted">Cash</span><span>${inr(port.cash)}</span></div>
+              <div class="row" style=${{ cursor: "default" }}><span class="muted">Invested</span><span>${inr(port.invested)}</span></div>
+              <div class="row" style=${{ cursor: "default" }}><span class="muted">Current value</span><span>${inr(port.current)}</span></div>
+            </div>`}
+        </div>
+      </div>
+    </main>`;
+}
+
+createRoot(document.getElementById("root")).render(html`<${App} />`);
+</script>
+</body>
+</html>

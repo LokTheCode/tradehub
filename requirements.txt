@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+strawberry-graphql[fastapi]
+yfinance
+python-dotenv
+# Only needed for real trading with Angel One (optional):
+# smartapi-python
+# pyotp
+# logzero
+# websocket-client
